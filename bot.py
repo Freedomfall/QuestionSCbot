@@ -7,7 +7,11 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatAction, ParseMode
+import static_ffmpeg
 import yt_dlp
+
+# Автоматически подключаем встроенные кодеки ffmpeg
+static_ffmpeg.add_paths()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -19,7 +23,6 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Кэш треков в памяти: {track_id: track_info}
 SEARCH_CACHE = {}
 
 # ----------------- ВЕБ-СЕРВЕР ДЛЯ FREE RENDER 24/7 -----------------
@@ -45,7 +48,7 @@ def format_time(seconds: int) -> str:
 async def start_cmd(message: Message):
     welcome_text = (
         "🎧 <b>Music Hunter Bot готов к работе!</b>\n\n"
-        "Я ищу и отправляю <b>полные версии треков</b> без 30-секундных ограничений.\n\n"
+        "Я ищу и отправляю <b>полные версии треков</b> без ограничений.\n\n"
         "Отправь мне имя артиста или название трека (например: <code>Laura Branigan Self Control</code>)."
     )
     await message.answer(welcome_text, parse_mode=ParseMode.HTML)
@@ -83,7 +86,6 @@ def search_tracks_sync(query: str):
                 artist = item.get('uploader', 'Исполнитель')
                 duration = int(item.get('duration') or 0)
 
-                # Игнорируем часовые миксы и стримы
                 if duration > 600 or duration < 40:
                     continue
 
@@ -102,16 +104,20 @@ def search_tracks_sync(query: str):
     return results
 
 def download_track_sync(video_url: str, chat_id: int):
-    """Скачивает аудиодорожку без потребности в ffmpeg."""
+    """Скачивает аудиодорожку с использованием встроенного static-ffmpeg."""
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{chat_id}_%(id)s.%(ext)s")
     ydl_opts = {
-        # Берем чистый m4a поток (Telegram читает его идеально как MP3)
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': out_tmpl,
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
         'max_filesize': 45 * 1024 * 1024,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'web_creator']
@@ -128,7 +134,7 @@ def download_track_sync(video_url: str, chat_id: int):
         artist = info.get('uploader', 'artist')
         duration = int(info.get('duration') or 0)
 
-        pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_*")
+        pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_*.mp3")
         found = glob.glob(pattern)
         if found:
             return found[0], title, artist, duration
@@ -192,7 +198,7 @@ async def callback_download_yt(callback: CallbackQuery):
         return
 
     await callback.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE)
-    wait_msg = await callback.message.answer(f"⚡ Загружаю трек в Telegram...", parse_mode=ParseMode.HTML)
+    wait_msg = await callback.message.answer("⚡ Загружаю трек в Telegram...", parse_mode=ParseMode.HTML)
 
     file_path = None
     try:
@@ -201,8 +207,7 @@ async def callback_download_yt(callback: CallbackQuery):
         )
 
         if file_path and os.path.exists(file_path):
-            ext = os.path.splitext(file_path)[1]
-            audio_file = FSInputFile(file_path, filename=f"{track['artist']} - {track['title']}{ext}")
+            audio_file = FSInputFile(file_path, filename=f"{track['artist']} - {track['title']}.mp3")
 
             caption = (
                 f"🎶 <b>{track['title']}</b>\n"
@@ -234,7 +239,7 @@ async def callback_download_yt(callback: CallbackQuery):
                 pass
 
 async def main():
-    print("Запуск музыкального сервиса...")
+    print("Запуск музыкального сервиса с поддержкой static-ffmpeg...")
     await start_web_server()
     print("Бот готов к приему сообщений!")
     await dp.start_polling(bot)
