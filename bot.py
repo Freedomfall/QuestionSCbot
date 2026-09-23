@@ -8,7 +8,6 @@ from aiogram.types import Message, FSInputFile
 from aiogram.enums import ChatAction
 import yt_dlp
 
-# Получаем токен из настроек хостинга
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("ОШИБКА: Переменная BOT_TOKEN не найдена в Environment Variables!")
@@ -19,8 +18,7 @@ dp = Dispatcher()
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# ----------------- ОБХОД ОГРАНИЧЕНИЯ RENDER -----------------
-# Render Free требует открытый веб-порт, иначе глушит процесс.
+# ----------------- ВЕБ-СЕРВЕР ДЛЯ RENDER -----------------
 async def health_check(request):
     return web.Response(text="Bot is running alive 24/7!")
 
@@ -32,53 +30,76 @@ async def start_web_server():
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Веб-сервер заглушки запущен на порту {port}")
-# -------------------------------------------------------------
+    print(f"Сервер заглушки слушает порт {port}")
+# --------------------------------------------------------
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     await message.answer(
         "👋 **Привет! Я бот для быстрого поиска музыки.**\n\n"
-        "Напиши мне название песни и исполнителя (например: `Eminem Mockingbird`), "
-        "и я мгновенно пришлю аудиозапись.",
+        "Отправь мне имя исполнителя или название песни (например: `Eminem Mockingbird`), "
+        "и я найду трек.",
         parse_mode="Markdown"
     )
 
 def download_audio_stream(query: str, chat_id: int):
-    """
-    Скачивание лучшего доступного аудио (m4a/mp3) без необходимости ffmpeg.
-    """
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{chat_id}_%(id)s.%(ext)s")
-    
-    ydl_opts = {
-        # Берем готовое аудио в m4a/mp3 (Telegram идеально их играет)
-        'format': 'bestaudio[ext=m4a]/bestaudio/best',
-        'default_search': 'ytsearch1:',
+
+    # Пробуем два источника: сначала YouTube (с обходом мобильным клиентом), затем SoundCloud
+    search_queries = [
+        f"ytsearch1:{query}",
+        f"scsearch1:{query}"
+    ]
+
+    base_opts = {
+        'format': 'bestaudio/best',
         'outtmpl': out_tmpl,
         'noplaylist': True,
         'quiet': True,
         'no_warnings': True,
-        # Ограничение размера до 45 МБ, чтобы влезть в лимит Telegram (50 МБ)
-        'max_filesize': 45 * 1024 * 1024,
+        'max_filesize': 48 * 1024 * 1024,
+        # Защита от блокировок дата-центров (эмуляция мобильного клиента Android)
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        },
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Mobile Safari/537.36'
+        }
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(query, download=True)
-        if 'entries' in info and len(info['entries']) > 0:
-            video_info = info['entries'][0]
-        else:
-            video_info = info
+    last_error = None
+    for target in search_queries:
+        try:
+            with yt_dlp.YoutubeDL(base_opts) as ydl:
+                info = ydl.extract_info(target, download=True)
+                if not info:
+                    continue
 
-        title = video_info.get('title', 'audio')
-        performer = video_info.get('uploader', 'Music Bot')
-        duration = video_info.get('duration', 0)
+                if 'entries' in info and len(info['entries']) > 0:
+                    video_info = info['entries'][0]
+                else:
+                    video_info = info
 
-        # Находим скачанный файл
-        pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_*")
-        found_files = glob.glob(pattern)
-        if found_files:
-            return found_files[0], title, performer, duration
-            
+                if not video_info:
+                    continue
+
+                title = video_info.get('title', 'audio')
+                performer = video_info.get('uploader', 'Unknown Artist')
+                duration = video_info.get('duration', 0)
+
+                # Находим файл, созданный под текущий запрос
+                pattern = os.path.join(DOWNLOAD_DIR, f"{chat_id}_*")
+                found_files = glob.glob(pattern)
+                if found_files:
+                    return found_files[0], title, performer, duration
+        except Exception as e:
+            last_error = e
+            continue
+
+    if last_error:
+        print(f"Ошибка загрузки: {last_error}")
     return None, None, None, None
 
 @dp.message(F.text)
@@ -88,21 +109,18 @@ async def handle_search(message: Message):
         await message.answer("Слишком короткий запрос для поиска.")
         return
 
-    # Показываем статус «Бот отправляет аудиофайл...»
     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VOICE)
     wait_msg = await message.answer(f"🔍 Ищу: <b>{query}</b>...", parse_mode="HTML")
 
     file_path = None
     try:
-        # Выполняем скачивание в отдельном потоке
         file_path, title, performer, duration = await asyncio.to_thread(
             download_audio_stream, query, message.chat.id
         )
 
         if file_path and os.path.exists(file_path):
-            await wait_msg.edit_text("⚡ Загружаю трек в Telegram...")
-            
-            # Определяем расширение
+            await wait_msg.edit_text("⚡ Трек найден, отправляю...")
+
             ext = os.path.splitext(file_path)[1]
             audio_file = FSInputFile(file_path, filename=f"{title}{ext}")
 
@@ -111,23 +129,19 @@ async def handle_search(message: Message):
                 title=title[:60],
                 performer=performer[:40],
                 duration=int(duration) if duration else None,
-                caption=f"🎧 <b>{title}</b>\n\nПриятного прослушивания!",
+                caption=f"🎵 <b>{title}</b>",
                 parse_mode="HTML"
             )
             await wait_msg.delete()
         else:
-            await wait_msg.edit_text("😔 Не удалось найти подходящий трек. Попробуй уточнить название.")
+            await wait_msg.edit_text("😔 По этому запросу трек не найден. Попробуй уточнить исполнителя.")
 
     except Exception as e:
-        err_msg = str(e)
-        if "File is larger than max_filesize" in err_msg:
-            await wait_msg.edit_text("⚠️ Трек слишком длинный (размер превышает лимит в 45 МБ).")
-        else:
-            await wait_msg.edit_text("⚠️ Ошибка при обработке запроса. Попробуй другой трек.")
-        print(f"Error: {e}")
+        print(f"Handler error: {e}")
+        await wait_msg.edit_text("⚠️ Ошибка при обработке. Попробуй еще раз через минуту.")
 
     finally:
-        # Гарантированное удаление файла после отправки или при ошибке
+        # Очистка диска
         if file_path and os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -136,9 +150,7 @@ async def handle_search(message: Message):
 
 async def main():
     print("Запуск сервиса...")
-    # Запускаем фоновый веб-сервер для бесплатного тарифа Render
     await start_web_server()
-    # Запускаем поллинг Telegram-бота
     print("Бот готов к приему сообщений!")
     await dp.start_polling(bot)
 
