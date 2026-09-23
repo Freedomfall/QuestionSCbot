@@ -5,7 +5,7 @@ from urllib.parse import quote
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
-from aiogram.types import Message, URLInputFile
+from aiogram.types import Message, CallbackQuery, URLInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ChatAction
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -15,9 +15,12 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# ----------------- ВЕБ-СЕРВЕР ДЛЯ FREE ТАРИФА RENDER -----------------
+# Временное хранилище найденных треков в памяти {track_id: track_data}
+SEARCH_CACHE = {}
+
+# ----------------- ВЕБ-СЕРВЕР ДЛЯ RENDER И PING 24/7 -----------------
 async def health_check(request):
-    return web.Response(text="Bot is online 24/7!")
+    return web.Response(text="Bot is awake and running 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -33,48 +36,41 @@ async def start_web_server():
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
     await message.answer(
-        "👋 **Привет! Я бот для быстрого поиска музыки.**\n\n"
-        "Отправь мне имя исполнителя или название песни (например: `Eminem Mockingbird` или `Self Control`), "
-        "и я найду трек.",
+        "👋 **Привет! Я музыкальный бот.**\n\n"
+        "Напиши название песни или артиста, и я предложу топ-5 лучших вариантов!",
         parse_mode="Markdown"
     )
 
-async def search_deezer_music(query: str):
-    """
-    Поиск через официальный открытый Deezer API.
-    Работает без ключей, не блокирует дата-центры, возвращает чистые метаданные и MP3.
-    """
+async def search_deezer_music_top5(query: str):
+    """Ищет до 5 результатов через Deezer API."""
     encoded_query = quote(query)
-    url = f"https://api.deezer.com/search?q={encoded_query}&limit=1"
+    url = f"https://api.deezer.com/search?q={encoded_query}&limit=5"
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
 
+    results_list = []
     try:
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    results = data.get("data", [])
-                    if results:
-                        track = results[0]
-                        title = track.get("title", "Трек")
-                        artist_name = track.get("artist", {}).get("name", "Исполнитель")
-                        preview_url = track.get("preview")
-                        duration = int(track.get("duration", 0))
-
-                        if preview_url:
-                            return {
-                                "title": title,
-                                "artist": artist_name,
-                                "url": preview_url,
-                                "duration": duration
-                            }
+                    tracks = data.get("data", [])
+                    for t in tracks:
+                        preview = t.get("preview")
+                        if preview:
+                            results_list.append({
+                                "id": str(t.get("id")),
+                                "title": t.get("title", "Без названия"),
+                                "artist": t.get("artist", {}).get("name", "Неизвестный исполнитель"),
+                                "duration": int(t.get("duration", 0)),
+                                "url": preview
+                            })
     except Exception as e:
-        print(f"Deezer Search Error: {e}")
+        print(f"Search API Error: {e}")
 
-    return None
+    return results_list
 
 @dp.message(F.text)
 async def handle_search(message: Message):
@@ -83,38 +79,65 @@ async def handle_search(message: Message):
         await message.answer("Слишком короткий запрос для поиска.")
         return
 
-    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.UPLOAD_VOICE)
-    wait_msg = await message.answer(f"🔍 Ищу: <b>{query}</b>...", parse_mode="HTML")
+    await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    status_msg = await message.answer(f"🔍 Ищу варианты для: <b>{query}</b>...", parse_mode="HTML")
+
+    tracks = await search_deezer_music_top5(query)
+
+    if not tracks:
+        await status_msg.edit_text("😔 По твоему запросу ничего не найдено. Попробуй уточнить название.")
+        return
+
+    text_lines = ["🎵 <b>Выберите трек для скачивания:</b>\n"]
+    keyboard_buttons = []
+
+    for idx, track in enumerate(tracks, start=1):
+        SEARCH_CACHE[track["id"]] = track
+        text_lines.append(f"{idx}. <b>{track['artist']}</b> — {track['title']}")
+        keyboard_buttons.append(
+            InlineKeyboardButton(text=f"🎧 {idx}", callback_data=f"play_{track['id']}")
+        )
+
+    # Клавиатура с кнопками в один или два ряда
+    inline_kb = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+
+    await status_msg.edit_text("\n".join(text_lines), reply_markup=inline_kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("play_"))
+async def callback_play_song(callback: CallbackQuery):
+    track_id = callback.data.split("_")[1]
+    track = SEARCH_CACHE.get(track_id)
+
+    await callback.answer()  # убираем часики на кнопке
+
+    if not track:
+        await callback.message.answer("⚠️ Срок действия выбора истек. Введите запрос заново.")
+        return
+
+    await callback.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE)
+    wait_msg = await callback.message.answer(f"⚡ Отправляю: <b>{track['artist']} - {track['title']}</b>...", parse_mode="HTML")
 
     try:
-        track = await search_deezer_music(query)
+        audio = URLInputFile(
+            url=track["url"],
+            filename=f"{track['artist']} - {track['title']}.mp3"
+        )
 
-        if track:
-            await wait_msg.edit_text("⚡ Трек найден, отправляю...")
-
-            audio = URLInputFile(
-                url=track["url"],
-                filename=f"{track['artist']} - {track['title']}.mp3"
-            )
-
-            await message.answer_audio(
-                audio=audio,
-                title=track["title"][:60],
-                performer=track["artist"][:40],
-                duration=track["duration"] if track["duration"] > 0 else None,
-                caption=f"🎵 <b>{track['artist']} - {track['title']}</b>\n\nБот готов искать следующий трек!",
-                parse_mode="HTML"
-            )
-            await wait_msg.delete()
-        else:
-            await wait_msg.edit_text("😔 По этому запросу трек не найден. Попробуй написать точнее (например: артист + трек).")
-
+        await callback.message.answer_audio(
+            audio=audio,
+            title=track["title"][:60],
+            performer=track["artist"][:40],
+            duration=track["duration"] if track["duration"] > 0 else None,
+            caption=f"🎵 <b>{track['artist']} - {track['title']}</b>",
+            parse_mode="HTML"
+        )
+        await wait_msg.delete()
     except Exception as e:
-        print(f"Handler error: {e}")
-        await wait_msg.edit_text("⚠️ Ошибка при отправке аудио. Попробуй еще раз.")
+        print(f"Send audio error: {e}")
+        await wait_msg.edit_text("⚠️ Ошибка отправки аудио. Попробуй еще раз.")
 
 async def main():
-    print("Запуск сервиса...")
+    print("Запуск музыкального сервиса...")
     await start_web_server()
     print("Бот готов к приему сообщений!")
     await dp.start_polling(bot)
