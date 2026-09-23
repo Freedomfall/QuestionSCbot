@@ -6,7 +6,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, URLInputFile, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.enums import ChatAction
+from aiogram.enums import ChatAction, ParseMode
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
@@ -15,12 +15,12 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Временное хранилище найденных треков в памяти {track_id: track_data}
+# Кэш для быстрого поиска треков по ID: {track_id: track_dict}
 SEARCH_CACHE = {}
 
-# ----------------- ВЕБ-СЕРВЕР ДЛЯ RENDER И PING 24/7 -----------------
+# ----------------- ВЕБ-СЕРВЕР ДЛЯ РАБОТЫ 24/7 -----------------
 async def health_check(request):
-    return web.Response(text="Bot is awake and running 24/7!")
+    return web.Response(text="Bot UI & Engine online 24/7!")
 
 async def start_web_server():
     app = web.Application()
@@ -30,19 +30,26 @@ async def start_web_server():
     port = int(os.getenv("PORT", 8080))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    print(f"Веб-сервер запущен на порту {port}")
-# ---------------------------------------------------------------------
+    print(f"Сервер мониторинга слушает порт {port}")
+# -------------------------------------------------------------
+
+def format_time(seconds: int) -> str:
+    """Форматирует секунды в вид MM:SS."""
+    m, s = divmod(seconds, 60)
+    return f"{m:02d}:{s:02d}"
 
 @dp.message(CommandStart())
 async def start_cmd(message: Message):
-    await message.answer(
-        "👋 **Привет! Я музыкальный бот.**\n\n"
-        "Напиши название песни или артиста, и я предложу топ-5 лучших вариантов!",
-        parse_mode="Markdown"
+    welcome_text = (
+        "🎧 <b>Добро пожаловать в Music Hunter!</b>\n\n"
+        "Я помогу найти и прослушать любой трек без лишних поисков и рекламы.\n\n"
+        "✨ <b>Как пользоваться:</b>\n"
+        "Просто отправь мне название песни или артиста в чат.\n\n"
+        "<i>Например:</i> <code>The Weeknd Blinding Lights</code>"
     )
+    await message.answer(welcome_text, parse_mode=ParseMode.HTML)
 
 async def search_deezer_music_top5(query: str):
-    """Ищет до 5 результатов через Deezer API."""
     encoded_query = quote(query)
     url = f"https://api.deezer.com/search?q={encoded_query}&limit=5"
 
@@ -56,19 +63,19 @@ async def search_deezer_music_top5(query: str):
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    tracks = data.get("data", [])
-                    for t in tracks:
+                    for t in data.get("data", []):
                         preview = t.get("preview")
                         if preview:
                             results_list.append({
                                 "id": str(t.get("id")),
                                 "title": t.get("title", "Без названия"),
-                                "artist": t.get("artist", {}).get("name", "Неизвестный исполнитель"),
+                                "artist": t.get("artist", {}).get("name", "Исполнитель"),
                                 "duration": int(t.get("duration", 0)),
-                                "url": preview
+                                "url": preview,
+                                "cover": t.get("album", {}).get("cover_medium")
                             })
     except Exception as e:
-        print(f"Search API Error: {e}")
+        print(f"API Error: {e}")
 
     return results_list
 
@@ -76,46 +83,59 @@ async def search_deezer_music_top5(query: str):
 async def handle_search(message: Message):
     query = message.text.strip()
     if len(query) < 2:
-        await message.answer("Слишком короткий запрос для поиска.")
+        await message.answer("⚠️ Напишите чуть подробнее для точного поиска.")
         return
 
     await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-    status_msg = await message.answer(f"🔍 Ищу варианты для: <b>{query}</b>...", parse_mode="HTML")
+    status_msg = await message.answer(f"🔎 <i>Ищу:</i> <b>{query}</b>...", parse_mode=ParseMode.HTML)
 
     tracks = await search_deezer_music_top5(query)
 
     if not tracks:
-        await status_msg.edit_text("😔 По твоему запросу ничего не найдено. Попробуй уточнить название.")
+        await status_msg.edit_text(
+            "😔 <b>Ничего не нашлось.</b>\nПопробуй проверить ошибки или написать имя артиста на английском.",
+            parse_mode=ParseMode.HTML
+        )
         return
 
-    text_lines = ["🎵 <b>Выберите трек для скачивания:</b>\n"]
-    keyboard_buttons = []
+    # Стильное оформление карточки выдачи
+    text_content = [
+        f"🎯 <b>Результаты поиска по запросу:</b> <i>«{query}»</i>\n",
+        "━━━━━━━━━━━━━━━━━━"
+    ]
 
+    keyboard_rows = []
     for idx, track in enumerate(tracks, start=1):
         SEARCH_CACHE[track["id"]] = track
-        text_lines.append(f"{idx}. <b>{track['artist']}</b> — {track['title']}")
-        keyboard_buttons.append(
-            InlineKeyboardButton(text=f"🎧 {idx}", callback_data=f"play_{track['id']}")
-        )
+        dur_str = format_time(track["duration"]) if track["duration"] else "03:30"
+        
+        text_content.append(f"<b>{idx}.</b> 🎵 <b>{track['title']}</b>")
+        text_content.append(f"    👤 {track['artist']}  ⏱ <code>{dur_str}</code>\n")
 
-    # Клавиатура с кнопками в один или два ряда
-    inline_kb = InlineKeyboardMarkup(inline_keyboard=[keyboard_buttons])
+        keyboard_rows.append([
+            InlineKeyboardButton(
+                text=f"▶️ Слушать #{idx}: {track['title'][:22]}",
+                callback_data=f"play_{track['id']}"
+            )
+        ])
 
-    await status_msg.edit_text("\n".join(text_lines), reply_markup=inline_kb, parse_mode="HTML")
+    text_content.append("━━━━━━━━━━━━━━━━━━\n<i>Нажмите на кнопку ниже, чтобы запустить трек:</i>")
+
+    reply_kb = InlineKeyboardMarkup(inline_keyboard=keyboard_rows)
+    await status_msg.edit_text("\n".join(text_content), reply_markup=reply_kb, parse_mode=ParseMode.HTML)
 
 @dp.callback_query(F.data.startswith("play_"))
 async def callback_play_song(callback: CallbackQuery):
     track_id = callback.data.split("_")[1]
     track = SEARCH_CACHE.get(track_id)
 
-    await callback.answer()  # убираем часики на кнопке
+    await callback.answer("⏳ Загружаю аудио...")
 
     if not track:
-        await callback.message.answer("⚠️ Срок действия выбора истек. Введите запрос заново.")
+        await callback.message.answer("⚠️ Сессия истекла. Отправьте запрос заново.")
         return
 
     await callback.bot.send_chat_action(chat_id=callback.message.chat.id, action=ChatAction.UPLOAD_VOICE)
-    wait_msg = await callback.message.answer(f"⚡ Отправляю: <b>{track['artist']} - {track['title']}</b>...", parse_mode="HTML")
 
     try:
         audio = URLInputFile(
@@ -123,23 +143,27 @@ async def callback_play_song(callback: CallbackQuery):
             filename=f"{track['artist']} - {track['title']}.mp3"
         )
 
+        caption = (
+            f"🎶 <b>{track['title']}</b>\n"
+            f"👤 <i>{track['artist']}</i>\n\n"
+            f"⚡ <i>Music Hunter Bot • Приятного прослушивания!</i>"
+        )
+
         await callback.message.answer_audio(
             audio=audio,
             title=track["title"][:60],
             performer=track["artist"][:40],
-            duration=track["duration"] if track["duration"] > 0 else None,
-            caption=f"🎵 <b>{track['artist']} - {track['title']}</b>",
-            parse_mode="HTML"
+            caption=caption,
+            parse_mode=ParseMode.HTML
         )
-        await wait_msg.delete()
     except Exception as e:
         print(f"Send audio error: {e}")
-        await wait_msg.edit_text("⚠️ Ошибка отправки аудио. Попробуй еще раз.")
+        await callback.message.answer("⚠️ Не удалось воспроизвести этот трек. Попробуйте другой из списка.")
 
 async def main():
-    print("Запуск музыкального сервиса...")
+    print("Запуск музыкального бота с новым интерфейсом...")
     await start_web_server()
-    print("Бот готов к приему сообщений!")
+    print("Бот готов к работе!")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
